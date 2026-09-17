@@ -6,6 +6,7 @@ import { ImageIcon, LoaderCircle, Trash2, UploadCloud } from "lucide-react";
 interface ArticleCoverUploaderProps {
   value: string;
   onChange: (path: string) => void;
+  onUploaded?: (path: string) => void;
 }
 
 const MAX_SOURCE_BYTES = 12 * 1024 * 1024;
@@ -80,6 +81,7 @@ async function compressCoverImage(file: File) {
 export default function ArticleCoverUploader({
   value,
   onChange,
+  onUploaded,
 }: ArticleCoverUploaderProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -110,6 +112,7 @@ export default function ArticleCoverUploader({
       const data = await response.json();
       if (!response.ok)
         throw new Error(data.error || "Gagal mengunggah gambar.");
+      onUploaded?.(data.path);
       onChange(data.path);
       setMessage(
         `Gambar tersimpan dan dikompres ke WebP (${Math.ceil(data.size / 1024)} KB).`,

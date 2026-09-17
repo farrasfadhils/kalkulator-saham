@@ -97,5 +97,6 @@ jobs:
             sudo docker compose -p "$APP_NAME" pull app
             sudo docker compose -p "$APP_NAME" up -d --wait postgres
             sudo docker compose -p "$APP_NAME" run --rm app prisma migrate deploy
+            sudo docker compose -p "$APP_NAME" run --rm app node scripts/migrate-article-media-to-cloudinary.mjs
             sudo docker compose -p "$APP_NAME" up -d --no-deps app
             sudo docker compose -p "$APP_NAME" ps

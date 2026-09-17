@@ -3,11 +3,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { verifySession } from "@/lib/auth";
 import {
-  deleteFromCloudinary,
-  deleteManyFromCloudinary,
+  extractArticleImageUrls,
   extractAllCloudinaryPublicIds,
-  extractCloudinaryPublicId,
+  isManagedCloudinaryUrl,
 } from "@/lib/cloudinary";
+import { flushArticleMediaCleanup } from "@/lib/article-media-cleanup";
 
 const ARTICLE_TYPES = new Set(["ARTICLE", "BLOG"]);
 const ARTICLE_STATUSES = new Set(["DRAFT", "PUBLISHED"]);
@@ -81,13 +81,13 @@ function parseArticleInput(body: Record<string, unknown>): {
   if (content.length < 50 || content.length > 200_000) {
     return { error: "Isi artikel harus berisi minimal 50 karakter." };
   }
-  if (
-    rawCover &&
-    !rawCover.startsWith("/") &&
-    !/^https?:\/\//i.test(rawCover)
-  ) {
+  const invalidImageUrls = extractArticleImageUrls(content, rawCover).filter(
+    (url) => !isManagedCloudinaryUrl(url),
+  );
+  if (invalidImageUrls.length > 0) {
     return {
-      error: "Gambar sampul harus berupa path lokal atau URL HTTP/HTTPS.",
+      error:
+        "Semua gambar artikel wajib berasal dari akun Cloudinary yang dikonfigurasi. Unggah ulang gambar lokal atau eksternal melalui tombol Upload Gambar.",
     };
   }
   if (rawCover.length > 2048)
@@ -149,6 +149,11 @@ export async function GET(req: NextRequest) {
   const type = searchParams.get("type");
 
   try {
+    if (session) {
+      await flushArticleMediaCleanup().catch((error) =>
+        console.error("Cloudinary cleanup retry failed:", error),
+      );
+    }
     if (id) {
       if (!session)
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -232,10 +237,11 @@ export async function PUT(req: NextRequest) {
     const parsed = parseArticleInput(body);
     if (!parsed.data)
       return NextResponse.json({ error: parsed.error }, { status: 400 });
+    const articleData = parsed.data;
 
     const [existing, category] = await Promise.all([
       prisma.article.findUnique({ where: { id } }),
-      prisma.category.findUnique({ where: { name: parsed.data.category } }),
+      prisma.category.findUnique({ where: { name: articleData.category } }),
     ]);
     if (!existing)
       return NextResponse.json(
@@ -249,41 +255,46 @@ export async function PUT(req: NextRequest) {
       );
 
     const traderPickError = await validateTraderPickLimit(
-      parsed.data.isTraderPick,
+      articleData.isTraderPick,
       existing.id,
     );
     if (traderPickError)
       return NextResponse.json({ error: traderPickError }, { status: 400 });
 
-    // Clean up old cover image if it was changed or removed
-    if (existing.coverImage && existing.coverImage !== parsed.data.coverImage) {
-      const oldCoverId = extractCloudinaryPublicId(existing.coverImage);
-      if (oldCoverId) {
-        deleteFromCloudinary(oldCoverId).catch((err) =>
-          console.error("Failed to delete replaced cover image from Cloudinary:", err),
-        );
+    const oldIds = extractAllCloudinaryPublicIds(
+      existing.content,
+      existing.coverImage,
+    );
+    const newIds = new Set(
+      extractAllCloudinaryPublicIds(
+        articleData.content,
+        articleData.coverImage,
+      ),
+    );
+    const removedIds = oldIds.filter((publicId) => !newIds.has(publicId));
+
+    const article = await prisma.$transaction(async (tx) => {
+      const updated = await tx.article.update({
+        where: { id },
+        data: {
+          ...articleData,
+          publishedAt:
+            existing.status === "DRAFT" && articleData.status === "PUBLISHED"
+              ? new Date()
+              : existing.publishedAt,
+        },
+      });
+      if (removedIds.length > 0) {
+        await tx.cloudinaryDeletionJob.createMany({
+          data: removedIds.map((publicId) => ({ publicId })),
+          skipDuplicates: true,
+        });
       }
-    }
-
-    // Clean up any inline content images that were removed in the new content
-    const oldInlineIds = extractAllCloudinaryPublicIds(existing.content);
-    const newInlineIds = new Set(extractAllCloudinaryPublicIds(parsed.data.content));
-    const removedInlineIds = oldInlineIds.filter((id) => !newInlineIds.has(id));
-    if (removedInlineIds.length > 0) {
-      deleteManyFromCloudinary(removedInlineIds).catch((err) =>
-        console.error("Failed to delete removed inline images from Cloudinary:", err),
-      );
-    }
-
-    const article = await prisma.article.update({
-      where: { id },
-      data: {
-        ...parsed.data,
-        publishedAt:
-          existing.status === "DRAFT" && parsed.data.status === "PUBLISHED"
-            ? new Date()
-            : existing.publishedAt,
-      },
+      return updated;
+    });
+    const mediaCleanup = await flushArticleMediaCleanup().catch((error) => {
+      console.error("Cloudinary cleanup failed after article update:", error);
+      return { deleted: 0, pending: null };
     });
     try {
       revalidateTag("articles", "max");
@@ -291,7 +302,7 @@ export async function PUT(req: NextRequest) {
       if (existing.slug !== article.slug)
         revalidateTag(`article-${article.slug}`, "max");
     } catch {}
-    return NextResponse.json({ success: true, article });
+    return NextResponse.json({ success: true, article, mediaCleanup });
   } catch (error) {
     return databaseErrorResponse(error);
   }
@@ -318,23 +329,30 @@ export async function DELETE(req: NextRequest) {
       );
     }
 
-    // Extract all Cloudinary images associated with this article (cover + body images)
     const cloudinaryIds = extractAllCloudinaryPublicIds(
       existing.content,
       existing.coverImage,
     );
-    if (cloudinaryIds.length > 0) {
-      deleteManyFromCloudinary(cloudinaryIds).catch((err) =>
-        console.error("Failed to clean up Cloudinary images on article delete:", err),
-      );
-    }
 
-    const article = await prisma.article.delete({ where: { id } });
+    const article = await prisma.$transaction(async (tx) => {
+      const deleted = await tx.article.delete({ where: { id } });
+      if (cloudinaryIds.length > 0) {
+        await tx.cloudinaryDeletionJob.createMany({
+          data: cloudinaryIds.map((publicId) => ({ publicId })),
+          skipDuplicates: true,
+        });
+      }
+      return deleted;
+    });
+    const mediaCleanup = await flushArticleMediaCleanup().catch((error) => {
+      console.error("Cloudinary cleanup failed after article deletion:", error);
+      return { deleted: 0, pending: null };
+    });
     try {
       revalidateTag("articles", "max");
       revalidateTag(`article-${article.slug}`, "max");
     } catch {}
-    return NextResponse.json({ success: true });
+    return NextResponse.json({ success: true, mediaCleanup });
   } catch (error) {
     return databaseErrorResponse(error);
   }

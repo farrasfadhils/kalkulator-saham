@@ -47,6 +47,8 @@ services:
       CLOUDINARY_URL: ${CLOUDINARY_URL:-}
     ports:
       - "127.0.0.1:${APP_PORT:-3000}:3000"
+    # Kept only so the one-time migration can read and remove legacy files.
+    # The application no longer writes article media to this volume.
     volumes:
       - article_uploads:/app/public/uploads
     depends_on:

@@ -1,14 +1,30 @@
-import { v2 as cloudinary, UploadApiResponse, UploadApiOptions } from "cloudinary";
+import { v2 as cloudinary, UploadApiOptions, UploadApiResponse } from "cloudinary";
 
-const cloudName =
-  process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME ||
-  process.env.CLOUDINARY_CLOUD_NAME;
+const CLOUDINARY_HOST = "res.cloudinary.com";
+const ARTICLE_MEDIA_FOLDER = "hitungsaham/articles/";
 
-// Initialize Cloudinary with environment variables
+function cloudNameFromUrl() {
+  const value = process.env.CLOUDINARY_URL;
+  if (!value) return null;
+  try {
+    return new URL(value).hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+export function getCloudinaryCloudName(): string | null {
+  return (
+    process.env.CLOUDINARY_CLOUD_NAME ||
+    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME ||
+    cloudNameFromUrl()
+  );
+}
+
+const cloudName = getCloudinaryCloudName();
+
 if (process.env.CLOUDINARY_URL) {
-  cloudinary.config({
-    secure: true,
-  });
+  cloudinary.config({ secure: true });
 } else if (
   cloudName &&
   process.env.CLOUDINARY_API_KEY &&
@@ -22,19 +38,21 @@ if (process.env.CLOUDINARY_URL) {
   });
 }
 
-/**
- * Checks if Cloudinary is configured via environment variables
- */
 export function isCloudinaryConfigured(): boolean {
-  const cName =
-    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME ||
-    process.env.CLOUDINARY_CLOUD_NAME;
   return Boolean(
-    process.env.CLOUDINARY_URL ||
-      (cName &&
-        process.env.CLOUDINARY_API_KEY &&
-        process.env.CLOUDINARY_API_SECRET)
+    getCloudinaryCloudName() &&
+      (process.env.CLOUDINARY_URL ||
+        (process.env.CLOUDINARY_API_KEY &&
+          process.env.CLOUDINARY_API_SECRET)),
   );
+}
+
+export function assertCloudinaryConfigured() {
+  if (!isCloudinaryConfigured()) {
+    throw new Error(
+      "Cloudinary belum dikonfigurasi. Isi CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, dan CLOUDINARY_API_SECRET.",
+    );
+  }
 }
 
 export interface CloudinaryUploadOptions {
@@ -44,17 +62,11 @@ export interface CloudinaryUploadOptions {
   transformation?: UploadApiOptions["transformation"];
 }
 
-/**
- * Upload an image buffer or base64 to Cloudinary using upload_stream
- * Ref: https://cloudinary.com/documentation/image_upload_api_reference
- */
 export async function uploadToCloudinary(
   buffer: Buffer,
-  options?: CloudinaryUploadOptions
+  options?: CloudinaryUploadOptions,
 ): Promise<UploadApiResponse> {
-  if (!isCloudinaryConfigured()) {
-    throw new Error("Cloudinary credentials are not configured in environment variables.");
-  }
+  assertCloudinaryConfigured();
 
   return new Promise((resolve, reject) => {
     const uploadOptions: UploadApiOptions = {
@@ -63,85 +75,123 @@ export async function uploadToCloudinary(
       public_id: options?.publicId,
       tags: options?.tags,
       transformation: options?.transformation,
+      overwrite: false,
     };
 
     const stream = cloudinary.uploader.upload_stream(
       uploadOptions,
       (error, result) => {
         if (error || !result) {
-          return reject(error || new Error("Failed to upload image to Cloudinary"));
+          reject(error || new Error("Gagal mengunggah gambar ke Cloudinary."));
+          return;
         }
         resolve(result);
-      }
+      },
     );
 
     stream.end(buffer);
   });
 }
 
-/**
- * Extracts the Cloudinary public_id from a Cloudinary image URL
- */
-export function extractCloudinaryPublicId(url: string | null | undefined): string | null {
-  if (!url || typeof url !== "string") return null;
-  const match = url.match(
-    /https?:\/\/res\.cloudinary\.com\/[^/]+\/image\/upload\/(?:[a-zA-Z0-9_,:-]+\/)*(?:v\d+\/)?([^\s\)\"\?#]+)/
-  );
-  if (!match || !match[1]) return null;
-  // Strip file extension (.webp, .jpg, .png, etc.)
-  return match[1].replace(/\.[a-zA-Z0-9]+$/, "");
-}
+export type CloudinaryAsset = {
+  url: string;
+  publicId: string;
+};
 
-/**
- * Extracts all Cloudinary public_ids from markdown content and optional cover image
- */
-export function extractAllCloudinaryPublicIds(
-  content?: string | null,
-  coverImage?: string | null
-): string[] {
-  const ids = new Set<string>();
+export function parseCloudinaryAsset(
+  value: string | null | undefined,
+): CloudinaryAsset | null {
+  if (!value || typeof value !== "string") return null;
 
-  if (coverImage) {
-    const coverId = extractCloudinaryPublicId(coverImage);
-    if (coverId) ids.add(coverId);
-  }
-
-  if (content) {
-    const regex =
-      /https?:\/\/res\.cloudinary\.com\/[^/]+\/image\/upload\/(?:[a-zA-Z0-9_,:-]+\/)*(?:v\d+\/)?([^\s\)\"\?#]+)/g;
-    let match;
-    while ((match = regex.exec(content)) !== null) {
-      if (match[1]) {
-        const publicId = match[1].replace(/\.[a-zA-Z0-9]+$/, "");
-        ids.add(publicId);
-      }
-    }
-  }
-
-  return Array.from(ids);
-}
-
-/**
- * Delete an image from Cloudinary by public ID
- */
-export async function deleteFromCloudinary(publicId: string) {
-  if (!isCloudinaryConfigured() || !publicId) return null;
   try {
-    return await cloudinary.uploader.destroy(publicId);
-  } catch (error) {
-    console.error(`Failed to delete Cloudinary asset (${publicId}):`, error);
+    const url = new URL(value);
+    const expectedCloudName = getCloudinaryCloudName();
+    const segments = url.pathname.split("/").filter(Boolean);
+
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== CLOUDINARY_HOST ||
+      !expectedCloudName ||
+      segments[0] !== expectedCloudName ||
+      segments[1] !== "image" ||
+      segments[2] !== "upload"
+    ) {
+      return null;
+    }
+
+    // Only parse the path after Cloudinary's version segment. This keeps
+    // delivery transformations out of the public_id.
+    const versionIndex = segments.findIndex(
+      (segment, index) => index >= 3 && /^v\d+$/.test(segment),
+    );
+    if (versionIndex < 0 || versionIndex === segments.length - 1) return null;
+
+    const publicId = segments
+      .slice(versionIndex + 1)
+      .map((segment) => decodeURIComponent(segment))
+      .join("/")
+      .replace(/\.[a-zA-Z0-9]+$/, "");
+
+    return publicId ? { url: value, publicId } : null;
+  } catch {
     return null;
   }
 }
 
-/**
- * Delete multiple images from Cloudinary by their public IDs
- */
+export function isManagedCloudinaryUrl(value: string): boolean {
+  return Boolean(
+    parseCloudinaryAsset(value)?.publicId.startsWith(ARTICLE_MEDIA_FOLDER),
+  );
+}
+
+export function extractArticleImageUrls(
+  content?: string | null,
+  coverImage?: string | null,
+): string[] {
+  const urls = new Set<string>();
+  if (coverImage?.trim()) urls.add(coverImage.trim());
+  if (!content) return Array.from(urls);
+
+  const markdownImage = /!\[[^\]]*\]\(\s*<?([^\s)>]+)>?(?:\s+["'][^"']*["'])?\s*\)/g;
+  const htmlImage = /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = markdownImage.exec(content)) !== null) {
+    if (match[1]) urls.add(match[1]);
+  }
+  while ((match = htmlImage.exec(content)) !== null) {
+    if (match[1]) urls.add(match[1]);
+  }
+
+  return Array.from(urls);
+}
+
+export function extractAllCloudinaryPublicIds(
+  content?: string | null,
+  coverImage?: string | null,
+): string[] {
+  const ids = new Set<string>();
+  for (const url of extractArticleImageUrls(content, coverImage)) {
+    const asset = parseCloudinaryAsset(url);
+    if (asset?.publicId.startsWith(ARTICLE_MEDIA_FOLDER)) {
+      ids.add(asset.publicId);
+    }
+  }
+  return Array.from(ids);
+}
+
+export async function deleteFromCloudinary(publicId: string) {
+  assertCloudinaryConfigured();
+  if (!publicId) throw new Error("Cloudinary public_id tidak boleh kosong.");
+  return cloudinary.uploader.destroy(publicId, {
+    resource_type: "image",
+    invalidate: true,
+  });
+}
+
 export async function deleteManyFromCloudinary(publicIds: string[]) {
-  if (!isCloudinaryConfigured() || !publicIds.length) return [];
   const uniqueIds = Array.from(new Set(publicIds.filter(Boolean)));
-  return Promise.allSettled(uniqueIds.map((id) => deleteFromCloudinary(id)));
+  return Promise.all(uniqueIds.map((id) => deleteFromCloudinary(id)));
 }
 
 export { cloudinary };
-

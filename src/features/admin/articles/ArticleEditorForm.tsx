@@ -200,6 +200,7 @@ export default function ArticleEditorForm({ mode, initialData }: Props) {
   const router = useRouter();
   const contentRef = useRef<HTMLTextAreaElement>(null);
   const inlineImageInputRef = useRef<HTMLInputElement>(null);
+  const sessionUploadUrlsRef = useRef(new Set<string>());
   const [uploadingInlineImage, setUploadingInlineImage] = useState(false);
   const [form, setForm] = useState<ArticleEditorData>(
     initialData ?? EMPTY_ARTICLE,
@@ -242,6 +243,20 @@ export default function ArticleEditorForm({ mode, initialData }: Props) {
       });
     return () => {
       active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const sessionUploads = sessionUploadUrlsRef.current;
+    return () => {
+      const urls = Array.from(sessionUploads);
+      if (!urls.length) return;
+      void fetch("/api/uploads/articles", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls }),
+        keepalive: true,
+      });
     };
   }, []);
 
@@ -311,6 +326,7 @@ export default function ArticleEditorForm({ mode, initialData }: Props) {
         throw new Error(data.error || "Gagal mengunggah gambar.");
       }
 
+      sessionUploadUrlsRef.current.add(data.path);
       const altText = file.name.replace(/\.[^/.]+$/, "") || "Gambar artikel";
       insertMarkdown(`\n\n![${altText}](`, `${data.path})\n\n`, "");
       setMessage({
@@ -916,6 +932,7 @@ export default function ArticleEditorForm({ mode, initialData }: Props) {
               <ArticleCoverUploader
                 value={form.coverImage}
                 onChange={(coverImage) => updateField("coverImage", coverImage)}
+                onUploaded={(url) => sessionUploadUrlsRef.current.add(url)}
               />
             </div>
           </section>
