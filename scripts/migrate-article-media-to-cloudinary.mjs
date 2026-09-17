@@ -2,7 +2,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { PrismaClient } from "@prisma/client";
-import { v2 as cloudinary } from "cloudinary";
 
 function loadLocalEnv() {
   const envPath = path.resolve(process.cwd(), ".env");
@@ -22,30 +21,43 @@ function loadLocalEnv() {
 
 loadLocalEnv();
 
-const cloudName =
-  process.env.CLOUDINARY_CLOUD_NAME ||
-  process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME;
-if (process.env.CLOUDINARY_URL) {
-  cloudinary.config({ secure: true });
-} else {
-  cloudinary.config({
-    cloud_name: cloudName,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET,
-    secure: true,
-  });
+function getCredentials() {
+  let cloudName =
+    process.env.CLOUDINARY_CLOUD_NAME ||
+    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME ||
+    "";
+  let apiKey = process.env.CLOUDINARY_API_KEY || "";
+  let apiSecret = process.env.CLOUDINARY_API_SECRET || "";
+
+  if (process.env.CLOUDINARY_URL) {
+    try {
+      const parsed = new URL(process.env.CLOUDINARY_URL);
+      if (parsed.username) apiKey = decodeURIComponent(parsed.username);
+      if (parsed.password) apiSecret = decodeURIComponent(parsed.password);
+      if (parsed.hostname) cloudName = parsed.hostname;
+    } catch {}
+  }
+
+  return { cloudName, apiKey, apiSecret };
 }
 
-if (
-  !process.env.CLOUDINARY_URL &&
-  (!cloudName ||
-    !process.env.CLOUDINARY_API_KEY ||
-    !process.env.CLOUDINARY_API_SECRET)
-) {
+const { cloudName, apiKey, apiSecret } = getCredentials();
+
+if (!cloudName || !apiKey || !apiSecret) {
   throw new Error("Cloudinary credentials are required before migration.");
 }
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL is required before migration.");
+}
+
+function signParams(params, secret) {
+  const sortedKeys = Object.keys(params).sort();
+  const toSign =
+    sortedKeys
+      .map((key) => `${key}=${Array.isArray(params[key]) ? params[key].join(",") : params[key]}`)
+      .join("&") + secret;
+
+  return crypto.createHash("sha1").update(toSign).digest("hex");
 }
 
 const prisma = new PrismaClient();
@@ -67,7 +79,7 @@ function isManagedUrl(value) {
   try {
     const url = new URL(value);
     const configuredCloudName =
-      cloudName || new URL(process.env.CLOUDINARY_URL).hostname;
+      cloudName || (process.env.CLOUDINARY_URL ? new URL(process.env.CLOUDINARY_URL).hostname : "");
     const segments = url.pathname.split("/").filter(Boolean);
     const versionIndex = segments.findIndex((segment) => /^v\d+$/.test(segment));
     const publicId =
@@ -93,14 +105,87 @@ function localFileFor(value) {
   return resolved;
 }
 
-function uploadFile(filePath) {
-  return cloudinary.uploader.upload(filePath, {
-    resource_type: "image",
-    folder: "hitungsaham/articles",
-    public_id: `migrated-${Date.now()}-${crypto.randomUUID()}`,
-    tags: ["hitungsaham", "article-media", "migrated"],
-    overwrite: false,
-  });
+async function uploadFile(filePath) {
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const folder = "hitungsaham/articles";
+  const publicId = `migrated-${Date.now()}-${crypto.randomUUID()}`;
+  const tags = "hitungsaham,article-media,migrated";
+  const overwrite = "false";
+
+  const paramsToSign = {
+    folder,
+    overwrite,
+    public_id: publicId,
+    tags,
+    timestamp,
+  };
+
+  const signature = signParams(paramsToSign, apiSecret);
+
+  const fileBuffer = fs.readFileSync(filePath);
+  const formData = new FormData();
+  formData.append("file", new Blob([fileBuffer]), path.basename(filePath));
+  formData.append("api_key", apiKey);
+  formData.append("timestamp", timestamp);
+  formData.append("folder", folder);
+  formData.append("public_id", publicId);
+  formData.append("tags", tags);
+  formData.append("overwrite", overwrite);
+  formData.append("signature", signature);
+
+  const res = await fetch(
+    `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`,
+    {
+      method: "POST",
+      body: formData,
+    },
+  );
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Cloudinary upload failed (${res.status}): ${errorText}`);
+  }
+
+  const data = await res.json();
+  return {
+    public_id: data.public_id,
+    secure_url: data.secure_url,
+  };
+}
+
+async function destroyFile(publicId) {
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const invalidate = "true";
+
+  const paramsToSign = {
+    invalidate,
+    public_id: publicId,
+    timestamp,
+  };
+
+  const signature = signParams(paramsToSign, apiSecret);
+
+  const formData = new FormData();
+  formData.append("public_id", publicId);
+  formData.append("timestamp", timestamp);
+  formData.append("invalidate", invalidate);
+  formData.append("api_key", apiKey);
+  formData.append("signature", signature);
+
+  const res = await fetch(
+    `https://api.cloudinary.com/v1_1/${cloudName}/image/destroy`,
+    {
+      method: "POST",
+      body: formData,
+    },
+  );
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Cloudinary destroy failed (${res.status}): ${errorText}`);
+  }
+
+  return res.json();
 }
 
 async function main() {
@@ -158,12 +243,7 @@ async function main() {
     );
   } catch (error) {
     await Promise.allSettled(
-      uploadedIds.map((publicId) =>
-        cloudinary.uploader.destroy(publicId, {
-          resource_type: "image",
-          invalidate: true,
-        }),
-      ),
+      uploadedIds.map((publicId) => destroyFile(publicId)),
     );
     throw error;
   }
