@@ -41,15 +41,6 @@ function getCredentials() {
   return { cloudName, apiKey, apiSecret };
 }
 
-const { cloudName, apiKey, apiSecret } = getCredentials();
-
-if (!cloudName || !apiKey || !apiSecret) {
-  throw new Error("Cloudinary credentials are required before migration.");
-}
-if (!process.env.DATABASE_URL) {
-  throw new Error("DATABASE_URL is required before migration.");
-}
-
 function signParams(params, secret) {
   const sortedKeys = Object.keys(params).sort();
   const toSign =
@@ -78,16 +69,20 @@ function imageUrls(content, coverImage) {
 function isManagedUrl(value) {
   try {
     const url = new URL(value);
-    const configuredCloudName =
-      cloudName || (process.env.CLOUDINARY_URL ? new URL(process.env.CLOUDINARY_URL).hostname : "");
+    const { cloudName: configuredCloudName } = getCredentials();
     const segments = url.pathname.split("/").filter(Boolean);
     const versionIndex = segments.findIndex((segment) => /^v\d+$/.test(segment));
     const publicId =
       versionIndex >= 0 ? segments.slice(versionIndex + 1).join("/") : "";
+    const cloudNameMatch = configuredCloudName
+      ? segments[0] === configuredCloudName
+      : Boolean(segments[0]);
     return (
       url.protocol === "https:" &&
       url.hostname === "res.cloudinary.com" &&
-      url.pathname.startsWith(`/${configuredCloudName}/image/upload/`) &&
+      cloudNameMatch &&
+      segments[1] === "image" &&
+      segments[2] === "upload" &&
       publicId.startsWith("hitungsaham/articles/")
     );
   } catch {
@@ -105,7 +100,8 @@ function localFileFor(value) {
   return resolved;
 }
 
-async function uploadFile(filePath) {
+async function uploadFile(filePath, credentials) {
+  const { cloudName, apiKey, apiSecret } = credentials;
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const folder = "hitungsaham/articles";
   const publicId = `migrated-${Date.now()}-${crypto.randomUUID()}`;
@@ -153,7 +149,8 @@ async function uploadFile(filePath) {
   };
 }
 
-async function destroyFile(publicId) {
+async function destroyFile(publicId, credentials) {
+  const { cloudName, apiKey, apiSecret } = credentials;
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const invalidate = "true";
 
@@ -189,6 +186,10 @@ async function destroyFile(publicId) {
 }
 
 async function main() {
+  if (!process.env.DATABASE_URL) {
+    throw new Error("DATABASE_URL is required before migration.");
+  }
+
   const articles = await prisma.article.findMany({
     select: { id: true, content: true, coverImage: true },
   });
@@ -213,16 +214,30 @@ async function main() {
     }
   }
 
+  if (!localUrls.length) {
+    console.log(
+      `No local article media found across ${articles.length} article(s). Migration skipped.`,
+    );
+    return;
+  }
+
+  const credentials = getCredentials();
+  if (!credentials.cloudName || !credentials.apiKey || !credentials.apiSecret) {
+    throw new Error(
+      `Found ${localUrls.length} local article image(s) to migrate, but Cloudinary credentials are missing. Please set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET (or CLOUDINARY_URL).`,
+    );
+  }
+
   console.log(
     `${dryRun ? "Dry run:" : "Migrating"} ${localUrls.length} unique local image(s) across ${articles.length} article(s).`,
   );
-  if (dryRun || !localUrls.length) return;
+  if (dryRun) return;
 
   const replacements = new Map();
   const uploadedIds = [];
   try {
     for (const value of localUrls) {
-      const result = await uploadFile(localFileFor(value));
+      const result = await uploadFile(localFileFor(value), credentials);
       replacements.set(value, result.secure_url);
       uploadedIds.push(result.public_id);
     }
@@ -243,7 +258,7 @@ async function main() {
     );
   } catch (error) {
     await Promise.allSettled(
-      uploadedIds.map((publicId) => destroyFile(publicId)),
+      uploadedIds.map((publicId) => destroyFile(publicId, credentials)),
     );
     throw error;
   }
